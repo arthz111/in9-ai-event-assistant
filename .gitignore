@@ -1,0 +1,5 @@
+.env
+__pycache__/
+*.py[cod]
+pedidos.json
+.vscode/
