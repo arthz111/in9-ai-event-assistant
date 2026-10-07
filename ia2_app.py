@@ -29,10 +29,9 @@ EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "").rstrip("/")
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
 EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "")
 SALES_PHONE_NUMBER = os.getenv("SALES_PHONE_NUMBER", "")
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+psycopg://in9_user:in9_password@localhost:5432/in9_db"
-)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL nao encontrada no arquivo .env")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 redis_client = Redis.from_url(REDIS_URL, decode_responses=True)

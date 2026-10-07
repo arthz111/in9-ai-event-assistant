@@ -1,5 +1,12 @@
 __pycache__/
 *.py[cod]
 .env
+.env.*
+!.env.example
 pedidos.json
 .vscode/
+*.log
+*.sql
+*.sqlite
+*.sqlite3
+docker-compose.override.yml
