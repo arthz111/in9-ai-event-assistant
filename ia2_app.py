@@ -1,17 +1,17 @@
 import json
-import hashlib
-import hmac
 import logging
 import os
 import threading
 import weakref
-from pathlib import Path
+import time
 from urllib.request import Request as UrlRequest, urlopen
 import asyncio
 from dotenv import load_dotenv
 from groq import Groq
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import PlainTextResponse
+from redis import Redis
+from sqlalchemy import JSON, Integer, MetaData, String, Table, Column, create_engine
 
 # ============================================================
 # 1. CONFIGURAÇÃO
@@ -25,10 +25,29 @@ if not GROQ_API_KEY:
 
 client = Groq(api_key=GROQ_API_KEY)
 MODELO = "openai/gpt-oss-20b"
-META_APP_SECRET = os.getenv("META_APP_SECRET", "")
-ARQUIVO_PEDIDOS = Path(__file__).with_name("pedidos.json")
+EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "").rstrip("/")
+EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
+EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "")
+SALES_PHONE_NUMBER = os.getenv("SALES_PHONE_NUMBER", "")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+psycopg://in9_user:in9_password@localhost:5432/in9_db"
+)
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
+metadata = MetaData()
+pedidos_table = Table(
+    "orders",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("event_type", String(255), nullable=False),
+    Column("location", String(500), nullable=False),
+    Column("schedule", String(255), nullable=False),
+    Column("guest_count", Integer, nullable=False),
+    Column("equipment", JSON, nullable=False),
+)
 logger = logging.getLogger(__name__)
-pedidos_lock = threading.Lock()
 
 # ============================================================
 # 2. FUNÇÕES REAIS DO SISTEMA (in9 Equipamentos)
@@ -40,13 +59,31 @@ CATALOGO_IN9 = [
     "skypaper", "canhão seguidor", "maquina de fumaça", 
     "grids q25", "palco", "tablado", "totem", "microfone", "microfones"
 ]
+TERMOS_NAO_CATALOGADOS = {
+    "metralhadora",
+}
 #Instrução fora da lista para a ia, se o cliente perguntar sobre o catalogo apenas de equipamentos, é obrigatorio q nao invente nenhum dado e que estritamente e obrigatoriamente envie oque esta escrito nesta lista.
 #Instrução 2 quero q quando o cliente peça somente o catalogo de equipamentos, exiba somente o catalogo pra ele olhar, qnd ele escolher os equipamentos q deseja, vc recomeça na captaçao de dados do cliente.
 #INSTRUÇÃO IMPORTANTE NUNCA EM HIPOTESE NENHUMA EXIBIR AÇOES DO SISTEMA AO USUARIO.
 def verificar_item_catalogo(item_solicitado: str) -> dict:
     """Verifica se a in9 trabalha com o equipamento solicitado."""
+    item_normalizado = (
+        item_solicitado.lower()
+        .replace("á", "a")
+        .replace("ã", "a")
+        .replace("ç", "c")
+    )
     for produto in CATALOGO_IN9:
-        if produto.lower().replace("á", "a").replace("ç", "c") in item_solicitado.lower().replace("á", "a").replace("ç", "c"):
+        produto_normalizado = (
+            produto.lower()
+            .replace("á", "a")
+            .replace("ã", "a")
+            .replace("ç", "c")
+        )
+        if produto_normalizado in item_normalizado or (
+            item_normalizado in produto_normalizado
+            and len(item_normalizado) >= 4
+        ):
             return {
                 "encontrado": True,
                 "mensagem": f"Sim, trabalhamos com locação de {produto}.",
@@ -59,36 +96,95 @@ def verificar_item_catalogo(item_solicitado: str) -> dict:
         "dica_ia": "Informe o cliente cordialmente que não temos este item. Os itens que temos são: " + ", ".join(CATALOGO_IN9)
     }
 
+
+def itens_nao_catalogados_mencionados(entrada_usuario: str) -> list[str]:
+    texto_normalizado = (
+        entrada_usuario.lower()
+        .replace("á", "a")
+        .replace("ã", "a")
+        .replace("ç", "c")
+    )
+    return [
+        item for item in TERMOS_NAO_CATALOGADOS
+        if item in texto_normalizado
+    ]
+
+
+def equipamentos_validos(equipamentos_lista: list) -> tuple[list[str], list[str]]:
+    validos = []
+    invalidos = []
+    for item in equipamentos_lista:
+        if not isinstance(item, str):
+            invalidos.append(str(item))
+            continue
+        resultado = verificar_item_catalogo(item)
+        if resultado["encontrado"]:
+            produto = next(
+                produto for produto in CATALOGO_IN9
+                if (
+                    produto.lower().replace("á", "a").replace("ã", "a").replace("ç", "c")
+                    in item.lower().replace("á", "a").replace("ã", "a").replace("ç", "c")
+                    or item.lower().replace("á", "a").replace("ã", "a").replace("ç", "c")
+                    in produto.lower().replace("á", "a").replace("ã", "a").replace("ç", "c")
+                )
+            )
+            if produto not in validos:
+                validos.append(produto)
+        else:
+            invalidos.append(item)
+    return validos, invalidos
+
+
 def repassar_para_vendedor(
     tipo_evento: str,
     local: str,
     horario: str,
     qtd_pessoas: int,
-    equipamentos_lista: list
+    equipamentos_lista: list,
+    numero_cliente: str = ""
 ) -> dict:
     """Função chamada APENAS quando a IA coleta TODOS os dados para repassar ao dono/vendedor."""
-    
-    resumo_pedido = {
-        "Tipo de Evento": tipo_evento,
-        "Local": local,
-        "Horário": horario,
-        "Quantidade de Pessoas": qtd_pessoas,
-        "Equipamentos Solicitados": equipamentos_lista
-    }
+    equipamentos_validos_lista, equipamentos_invalidos = equipamentos_validos(
+        equipamentos_lista
+    )
+    if equipamentos_invalidos:
+        return {
+            "sucesso": False,
+            "erro": "Há equipamento fora do catálogo.",
+            "equipamentos_invalidos": equipamentos_invalidos,
+            "catalogo": CATALOGO_IN9,
+            "dica_ia": (
+                "Não confirme nem registre os itens inválidos. Informe quais itens "
+                "não estão disponíveis e apresente somente o catálogo oficial."
+            ),
+        }
 
-    with pedidos_lock:
-        pedidos = []
-        if ARQUIVO_PEDIDOS.exists():
-            try:
-                with ARQUIVO_PEDIDOS.open("r", encoding="utf-8") as arquivo:
-                    pedidos_existentes = json.load(arquivo)
-                pedidos = pedidos_existentes if isinstance(pedidos_existentes, list) else [pedidos_existentes]
-            except json.JSONDecodeError:
-                logger.warning("pedidos.json inválido; iniciando uma nova lista de pedidos")
+    with engine.begin() as connection:
+        connection.execute(
+            pedidos_table.insert().values(
+                event_type=tipo_evento,
+                location=local,
+                schedule=horario,
+                guest_count=qtd_pessoas,
+                equipment=equipamentos_validos_lista,
+            )
+        )
 
-        pedidos.append(resumo_pedido)
-        with ARQUIVO_PEDIDOS.open("w", encoding="utf-8") as arquivo:
-            json.dump(pedidos, arquivo, ensure_ascii=False, indent=2)
+    if SALES_PHONE_NUMBER:
+        mensagem_vendedor = (
+            "Novo pedido de locação recebido!\n\n"
+            f"Cliente: {numero_cliente or 'não informado'}\n"
+            f"Tipo de evento: {tipo_evento}\n"
+            f"Local: {local}\n"
+            f"Data/horário: {horario}\n"
+            f"Quantidade de pessoas: {qtd_pessoas}\n"
+            "Equipamentos: " + ", ".join(equipamentos_validos_lista) + "\n\n"
+            "O cliente foi avisado. Você já pode iniciar a negociação."
+        )
+        enviar_mensagem_evolution(SALES_PHONE_NUMBER, mensagem_vendedor)
+
+    if numero_cliente:
+        ativar_atendimento_manual(numero_cliente)
 
     return {
         "sucesso": True,
@@ -183,19 +279,25 @@ REGRAS RÍGIDAS (NUNCA QUEBRE):
    - Quantas pessoas estarão no evento
 6. Seja natural, simpática e não faça um questionário robótico. Pergunte as coisas aos poucos se o cliente for vago.
 7. Assim que tiver TODAS as 5 informações, chame a função 'repassar_para_vendedor'.
+9. NUNCA confirme que um equipamento está disponível sem antes chamar
+   'verificar_item_catalogo' para CADA equipamento mencionado pelo cliente.
+   Isso inclui listas com vários itens. Se um item não estiver no catálogo,
+   diga claramente que ele não está disponível e não o inclua no pedido.
+10. Só diga que um item foi aceito depois que a ferramenta retornar
+    'encontrado: true'. Nunca aceite nomes por semelhança ou por conhecimento externo.
+11. Depois que 'repassar_para_vendedor' retornar sucesso, informe ao cliente que
+    um vendedor assumirá o atendimento. Não continue fazendo perguntas de triagem.
 8. Se o cliente falar algo fora do contexto de eventos e locação de equipamentos, 
 redirecione educadamente para o assunto principal.
 """
 
-from datetime import datetime, timedelta
-
-# Controle de limite e timeout por usuário
-limite_usuarios = {}
-timeout_usuarios = {}
-historicos = {}
+# Controle de limite e histórico por usuário
 estado_usuarios_lock = threading.RLock()
 locks_usuarios = weakref.WeakValueDictionary()
-TEMPO_LIMPEZA_ESTADO = timedelta(hours=2)
+TTL_ESTADO_SEGUNDOS = 2 * 60 * 60
+TTL_SESSAO_SEGUNDOS = 30 * 60
+LIMITE_MENSAGENS = 20
+TTL_ATENDIMENTO_MANUAL_SEGUNDOS = 7 * 24 * 60 * 60
 
 
 def obter_lock_usuario(numero_cliente: str) -> threading.RLock:
@@ -206,78 +308,83 @@ def obter_lock_usuario(numero_cliente: str) -> threading.RLock:
 def verificar_timeout(numero_cliente: str) -> bool:
     lock_usuario = obter_lock_usuario(numero_cliente)
     with lock_usuario:
-        with estado_usuarios_lock:
-            agora = datetime.now()
-            ultimo_contato = timeout_usuarios.get(numero_cliente)
-
-            for usuario, ultimo_contato_usuario in list(timeout_usuarios.items()):
-                if usuario != numero_cliente and agora - ultimo_contato_usuario > TEMPO_LIMPEZA_ESTADO:
-                    timeout_usuarios.pop(usuario, None)
-                    limite_usuarios.pop(usuario, None)
-                    historicos.pop(usuario, None)
-
-            sessao_expirada = (
-                ultimo_contato is not None
-                and agora - ultimo_contato > timedelta(minutes=30)
-            )
-
-            if sessao_expirada:
-                historicos[numero_cliente] = [
-                    {"role": "system", "content": prompt_sistema}
-                ]
-
-            timeout_usuarios[numero_cliente] = agora
-            return sessao_expirada
+        chave_timeout = f"in9:session:last-contact:{numero_cliente}"
+        ultimo_contato = redis_client.get(chave_timeout)
+        agora = time.time()
+        sessao_expirada = (
+            ultimo_contato is not None
+            and agora - float(ultimo_contato) > TTL_SESSAO_SEGUNDOS
+        )
+        if sessao_expirada:
+            redis_client.delete(f"in9:conversation:{numero_cliente}")
+        redis_client.setex(chave_timeout, TTL_ESTADO_SEGUNDOS, str(agora))
+        return sessao_expirada
 
 def verificar_limite(numero_cliente: str) -> bool:
-    with estado_usuarios_lock:
-        agora = datetime.now()
+    chave_limite = f"in9:rate-limit:{numero_cliente}"
+    mensagens = redis_client.incr(chave_limite)
+    if mensagens == 1:
+        redis_client.expire(chave_limite, 60 * 60)
+    return mensagens <= LIMITE_MENSAGENS
 
-        for usuario, dados_usuario in list(limite_usuarios.items()):
-            if agora - dados_usuario["inicio"] > TEMPO_LIMPEZA_ESTADO:
-                limite_usuarios.pop(usuario, None)
-                timeout_usuarios.pop(usuario, None)
-                historicos.pop(usuario, None)
 
-        if numero_cliente not in limite_usuarios:
-            limite_usuarios[numero_cliente] = {
-                "mensagens": 0,
-                "inicio": agora,
-                "bloqueado": False
-            }
+def carregar_historico(numero_cliente: str) -> list[dict]:
+    historico_json = redis_client.get(f"in9:conversation:{numero_cliente}")
+    if historico_json is None:
+        return [{"role": "system", "content": prompt_sistema}]
+    return json.loads(historico_json)
 
-        usuario = limite_usuarios[numero_cliente]
 
-        # Reset a cada 1 hora
-        if agora - usuario["inicio"] > timedelta(hours=1):
-            usuario["mensagens"] = 0
-            usuario["inicio"] = agora
-            usuario["bloqueado"] = False
+def salvar_historico(numero_cliente: str, mensagens: list[dict]) -> None:
+    redis_client.setex(
+        f"in9:conversation:{numero_cliente}",
+        TTL_ESTADO_SEGUNDOS,
+        json.dumps(mensagens, ensure_ascii=False),
+    )
 
-        # Limite de 20 mensagens por hora
-        if usuario["mensagens"] >= 20:
-            usuario["bloqueado"] = True
-            return False
 
-        usuario["mensagens"] += 1
-        return True
+def atendimento_manual_ativo(numero_cliente: str) -> bool:
+    return redis_client.exists(f"in9:manual:{numero_cliente}") == 1
+
+
+def ativar_atendimento_manual(numero_cliente: str) -> None:
+    redis_client.setex(
+        f"in9:manual:{numero_cliente}",
+        TTL_ATENDIMENTO_MANUAL_SEGUNDOS,
+        "1",
+    )
+
+
+def reativar_atendimento_ia(numero_cliente: str) -> None:
+    redis_client.delete(f"in9:manual:{numero_cliente}")
+
+
+def mensagem_modelo_para_dict(mensagem: object) -> dict:
+    if hasattr(mensagem, "model_dump"):
+        return mensagem.model_dump(exclude_none=True)
+    return dict(mensagem)
 
 def responder(
     numero_cliente: str,
     entrada_usuario: str,
     verificar_limite_cliente: bool = True
-) -> str:
+) -> str | None:
     """Processa uma mensagem e mantém o histórico separado por cliente."""
     lock_usuario = obter_lock_usuario(numero_cliente)
     with lock_usuario:
         if verificar_limite_cliente and not verificar_limite(numero_cliente):
             return "Você atingiu o limite de mensagens. Tente novamente em 1 hora."
+        if atendimento_manual_ativo(numero_cliente):
+            return None
+        itens_invalidos = itens_nao_catalogados_mencionados(entrada_usuario)
+        if itens_invalidos:
+            return (
+                f"Não temos {', '.join(itens_invalidos)} no catálogo. "
+                "Trabalhamos apenas com: " + ", ".join(CATALOGO_IN9) + "."
+            )
 
         with estado_usuarios_lock:
-            historico = historicos.setdefault(
-                numero_cliente,
-                [{"role": "system", "content": prompt_sistema}]
-            )
+            historico = carregar_historico(numero_cliente)
             historico.append({"role": "user", "content": entrada_usuario})
             mensagens = list(historico)
 
@@ -290,11 +397,13 @@ def responder(
         mensagem_resposta = resposta.choices[0].message
 
         if mensagem_resposta.tool_calls:
-            mensagens.append(mensagem_resposta)
+            mensagens.append(mensagem_modelo_para_dict(mensagem_resposta))
             for tool_call in mensagem_resposta.tool_calls:
                 nome_funcao = tool_call.function.name
                 argumentos = json.loads(tool_call.function.arguments or "{}")
                 if nome_funcao in FUNCOES_DISPONIVEIS:
+                    if nome_funcao == "repassar_para_vendedor":
+                        argumentos["numero_cliente"] = numero_cliente
                     resultado_funcao = FUNCOES_DISPONIVEIS[nome_funcao](**argumentos)
                     mensagens.append({
                         "role": "tool",
@@ -314,7 +423,7 @@ def responder(
         mensagens.append({"role": "assistant", "content": texto_ia})
 
         with estado_usuarios_lock:
-            historicos[numero_cliente] = mensagens
+            salvar_historico(numero_cliente, mensagens)
         return texto_ia
 
 
@@ -327,6 +436,13 @@ mensagens_processadas = set()
 mensagens_em_processamento = set()
 mensagens_processadas_lock = threading.Lock()
 MAX_MENSAGENS_PROCESSADAS = 1000
+
+
+@app.on_event("startup")
+def inicializar_banco() -> None:
+    redis_client.ping()
+    metadata.create_all(engine)
+    logger.info("PostgreSQL e Redis inicializados")
 
 
 def assinatura_meta_valida(corpo: bytes, assinatura: str) -> bool:
@@ -371,6 +487,79 @@ def enviar_mensagem_meta(numero_cliente: str, texto: str) -> None:
     )
     with urlopen(requisicao, timeout=20):
         pass
+
+
+def enviar_mensagem_evolution(numero_cliente: str, texto: str) -> None:
+    if not all((EVOLUTION_API_URL, EVOLUTION_API_KEY, EVOLUTION_INSTANCE)):
+        raise RuntimeError("Evolution API não está configurada no arquivo .env")
+    url = f"{EVOLUTION_API_URL}/message/sendText/{EVOLUTION_INSTANCE}"
+    dados = json.dumps({
+        "number": numero_cliente,
+        "text": texto,
+    }).encode("utf-8")
+    requisicao = UrlRequest(
+        url,
+        data=dados,
+        headers={
+            "apikey": EVOLUTION_API_KEY,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urlopen(requisicao, timeout=20):
+        pass
+
+
+def extrair_mensagem_evolution(dados: dict) -> tuple[str, str] | None:
+    evento = dados.get("data", {})
+    chave = evento.get("key", {})
+    numero_cliente = chave.get("remoteJid", "").split("@", 1)[0]
+    conteudo = evento.get("message", {})
+    texto = conteudo.get("conversation") or conteudo.get(
+        "extendedTextMessage", {}
+    ).get("text")
+    if not numero_cliente or not texto or chave.get("fromMe"):
+        return None
+    return numero_cliente, texto.strip()
+
+
+@app.post("/evolution-webhook")
+async def receber_webhook_evolution(request: Request):
+    try:
+        dados = await request.json()
+    except ValueError:
+        return PlainTextResponse("JSON inválido", status_code=400)
+
+    if dados.get("event") != "messages.upsert":
+        return {"status": "ignored"}
+    mensagem = extrair_mensagem_evolution(dados)
+    if mensagem is None:
+        return {"status": "ignored"}
+
+    numero_cliente, texto = mensagem
+    identificador = dados.get("data", {}).get("key", {}).get("id")
+    if identificador:
+        with mensagens_processadas_lock:
+            if identificador in mensagens_processadas:
+                return {"status": "duplicate"}
+            if len(mensagens_processadas) >= MAX_MENSAGENS_PROCESSADAS:
+                mensagens_processadas.clear()
+            mensagens_processadas.add(identificador)
+
+    if verificar_timeout(numero_cliente):
+        await asyncio.to_thread(
+            enviar_mensagem_evolution,
+            numero_cliente,
+            "Sua sessão expirou por inatividade. Vamos recomeçar!",
+        )
+    resposta = await asyncio.to_thread(responder, numero_cliente, texto)
+    if resposta is not None:
+        await asyncio.to_thread(
+            enviar_mensagem_evolution,
+            numero_cliente,
+            resposta,
+        )
+    return {"status": "ok"}
 
 
 @app.post("/webhook")
